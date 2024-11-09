@@ -1,3 +1,8 @@
+
+<p align="center">
+  <a href="READMEzh-CN.md">中文版</a>
+</p>
+
 # Async Task Manager Documentation
 
 ## Overview
