@@ -19,6 +19,37 @@ class AsyncTaskManager
     {
         $this->loop = Factory::create();
         $this->taskQueue = new SplPriorityQueue();
+<?php
+class AsyncTaskManager
+{
+    private $loop;
+    private $taskQueue;
+    private $taskStates = [];
+    private $maxConcurrentTasks;
+    private $logger;
+    private $maxRetries;
+    private $enableRetry;
+<?php
+class AsyncTaskManager
+{
+    private $loop;
+    private $taskQueue;
+    private $taskStates = [];
+    private $maxConcurrentTasks;
+    private $logger;
+    private $maxRetries;
+    private $enableRetry;
+    private $semaphore;
+    private $logLevel;
+    private $currentTasks = 0;  // Track the number of tasks currently running
+    private $failedTaskQueue = [];
+    private $taskCancelQueue = [];
+    private $isShuttingDown = false; // Whether the system is shutting down gracefully
+
+    public function __construct(array $config = [])
+    {
+        $this->loop = Factory::create();
+        $this->taskQueue = new SplPriorityQueue();
         $this->semaphore = new Semaphore($config['maxConcurrentTasks'] ?? 5);
         $this->maxConcurrentTasks = $config['maxConcurrentTasks'] ?? 5;
         $this->maxRetries = $config['maxRetries'] ?? 3;
@@ -56,39 +87,26 @@ class AsyncTaskManager
 
     public function run()
     {
-        $this->log("Task manager started", 'INFO');
+        $this->log("Task manager started", 'DEBUG');
 
         // Run the task queue every 0.1 second
         $this->loop->addPeriodicTimer(0.1, function () {
             if ($this->isShuttingDown) return;
 
             while (!$this->taskQueue->isEmpty() && $this->currentTasks < $this->maxConcurrentTasks) {
-                // Get the next task
                 $taskData = $this->taskQueue->extract();
 
                 // Check if the task has dependencies that are not completed
-                if ($taskData['dependsOn']) {
-                    // If the task has dependencies, check if all dependent tasks are completed
-                    $allDependenciesCompleted = true;
-                    foreach ($taskData['dependsOn'] as $depId) {
-                        if (!isset($this->taskStates[$depId]) || $this->taskStates[$depId]['status'] !== 'Completed') {
-                            $allDependenciesCompleted = false;
-                            break;
-                        }
-                    }
-
-                    if (!$allDependenciesCompleted) {
-                        // If dependencies are not completed, re-insert the task into the queue
-                        $this->taskQueue->insert($taskData, $taskData['priority']);
-                        continue;  // Skip this task, wait for dependencies to finish
-                    }
+                if ($this->checkDependencies($taskData)) {
+                    $this->taskQueue->insert($taskData, $taskData['priority']);
+                    continue;
                 }
 
                 // Check if the task is canceled
                 if ($taskData['cancel']) {
                     $taskData['status'] = 'Cancelled';
-                    $this->log("Task cancelled: {$taskData['id']}", 'INFO');
-                    continue; // Skip this task
+                    $this->log("Task cancelled: {$taskData['id']}", 'DEBUG');
+                    continue;
                 }
 
                 // Acquire semaphore (ensure the maximum concurrent tasks limit is not exceeded)
@@ -111,12 +129,22 @@ class AsyncTaskManager
         // Monitor shutdown tasks
         $this->loop->addPeriodicTimer(1, function () {
             if ($this->isShuttingDown && $this->currentTasks === 0) {
-                $this->log("All tasks completed, system has shut down gracefully", 'INFO');
+                $this->log("All tasks completed, system has shut down gracefully", 'DEBUG');
                 $this->loop->stop();
             }
         });
 
         $this->loop->run();
+    }
+
+    private function checkDependencies(array &$taskData)
+    {
+        foreach ($taskData['dependsOn'] as $depId) {
+            if (!isset($this->taskStates[$depId]) || $this->taskStates[$depId]['status'] !== 'Completed') {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function executeTask(array &$taskData)
@@ -128,23 +156,20 @@ class AsyncTaskManager
         // Start task execution
         $this->loop->futureTick(function () use (&$taskData, $deferred) {
             try {
-                // Check if the task is canceled
                 if ($taskData['cancel']) {
                     $taskData['status'] = 'Cancelled';
-                    $this->log("Task cancelled: {$taskData['id']}", 'INFO');
+                    $this->log("Task cancelled: {$taskData['id']}", 'DEBUG');
                     $deferred->reject('Task cancelled');
                     return;
                 }
 
-                // Check for task timeout
                 if ($taskData['timeout'] && (microtime(true) - $taskData['startTime']) > $taskData['timeout']) {
                     throw new TimeoutException("Task timeout");
                 }
 
-                // Execute the task
                 $result = $taskData['task']();
                 $taskData['status'] = 'Completed';
-                $this->log("Task completed successfully, result: {$result}", 'INFO');
+                $this->log("Task completed successfully, result: {$result}", 'DEBUG');
                 $deferred->resolve($result);
             } catch (TimeoutException $e) {
                 $taskData['status'] = 'Failed';
@@ -159,7 +184,6 @@ class AsyncTaskManager
                 $taskData['status'] = 'Failed';
                 $this->handleTaskError($taskData, $deferred, $e, 'General Error');
             } finally {
-                // Release semaphore after task is complete
                 $this->semaphore->release();
             }
         });
@@ -184,10 +208,8 @@ class AsyncTaskManager
             $taskData['backoff'] *= 2;  // Exponential backoff
             $this->log("Task failed, retry attempt {$taskData['retries']} of {$errorType}, error: {$e->getMessage()}", 'ERROR');
 
-            // Randomize backoff time to avoid retry storms
             $randomBackoff = mt_rand($taskData['backoff'], $taskData['backoff'] * 2);
 
-            // Set retry interval based on backoff
             $this->loop->addTimer($randomBackoff, function () use ($taskData) {
                 $this->taskQueue->insert($taskData, $taskData['priority']);
             });
@@ -221,7 +243,7 @@ class AsyncTaskManager
         // Dynamically adjust concurrency based on current task count and system load
         if ($this->currentTasks < $this->maxConcurrentTasks) {
             $this->semaphore->setMaxConcurrency($this->maxConcurrentTasks + 1);  // Example: dynamically increase concurrency
-            $this->log("Semaphore concurrency has been dynamically adjusted", 'INFO');
+            $this->log("Semaphore concurrency has been dynamically adjusted", 'DEBUG');
         }
     }
 
@@ -243,7 +265,7 @@ class AsyncTaskManager
     {
         if (isset($this->taskStates[$taskId])) {
             $this->taskStates[$taskId]['cancel'] = true;
-            $this->log("Task cancelled: {$taskId}", 'INFO');
+            $this->log("Task cancelled: {$taskId}", 'DEBUG');
         } else {
             $this->log("Attempt to cancel non-existing task: {$taskId}", 'ERROR');
         }
@@ -253,13 +275,13 @@ class AsyncTaskManager
     public function shutDown()
     {
         $this->isShuttingDown = true;
-        $this->log("Task manager is shutting down...", 'INFO');
+        $this->log("Task manager is shutting down...", 'DEBUG');
         // Wait until all tasks are finished before shutting down
         $this->loop->addPeriodicTimer(1, function () {
             if ($this->currentTasks === 0) {
-                $this->log("All tasks completed, task manager has shut down", 'INFO');
+                $this->log("All tasks completed, task manager has shut down", 'DEBUG');
                 $this->loop->stop();
             }
         });
     }
-          }
+}
